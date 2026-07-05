@@ -6,6 +6,7 @@ uses
   System.SysUtils,
   System.Classes,
   System.Generics.Collections,
+  System.IniFiles,
   Vcl.Controls,
   Vcl.ComCtrls,
   Vcl.ExtCtrls,
@@ -27,6 +28,7 @@ type
     FBuildTimer: TTimer;
     FLastReportedParsedCount: Integer;
     FPendingRefresh: Boolean;
+    FRestoringTreeState: Boolean;
     FHideExternal: Boolean;
     FLastStatus: string;
     FOnStatusChanged: TNotifyEvent;
@@ -49,11 +51,17 @@ type
     function NodeFolderPath(ANode: TTreeNode): string;
     procedure CaptureExpandState(ANode: TTreeNode; AExpanded: TList<string>);
     procedure RestoreExpandState(ANode: TTreeNode; AExpanded: TList<string>);
+    function FindNodeByPathKey(const APathKey: string): TTreeNode;
+    procedure LoadTreeState(AExpanded: TList<string>; out ASelectedPath: string);
+    procedure SaveTreeState;
     procedure SetStatus(const AStatus: string);
 
     procedure TreeDblClick(Sender: TObject);
     procedure TreeKeyDown(Sender: TObject; var Key: Word; Shift: TShiftState);
     procedure TreeHint(Sender: TObject; const Node: TTreeNode; var Hint: string);
+    procedure TreeSelectionChanged(Sender: TObject; Node: TTreeNode);
+    procedure TreeExpanded(Sender: TObject; Node: TTreeNode);
+    procedure TreeCollapsed(Sender: TObject; Node: TTreeNode);
     procedure TreeMouseDown(Sender: TObject; Button: TMouseButton;
       Shift: TShiftState; X, Y: Integer);
     procedure PopupMenuPopup(Sender: TObject);
@@ -79,6 +87,41 @@ uses
   Vcl.Dialogs,
   DepTree.OTAUtils,
   DepTree.ShellIcons;
+
+function TreeStateFileName: string;
+var
+  BaseDir: string;
+begin
+  BaseDir := GetEnvironmentVariable('APPDATA');
+  if BaseDir = '' then
+    BaseDir := GetEnvironmentVariable('LOCALAPPDATA');
+  if BaseDir = '' then
+    BaseDir := GetEnvironmentVariable('TEMP');
+  if BaseDir = '' then
+    BaseDir := ExtractFilePath(ParamStr(0));
+
+  Result := IncludeTrailingPathDelimiter(BaseDir) +
+    'Codex' + PathDelim + 'DelphiTree' + PathDelim + 'ProjectSourceTree.ini';
+end;
+
+function HashText32(const AText: string): string;
+var
+  Hash: Cardinal;
+  Index: Integer;
+begin
+  Hash := $811C9DC5;
+  for Index := 1 to Length(AText) do
+  begin
+    Hash := Hash xor Ord(AText[Index]);
+    Hash := Cardinal((UInt64(Hash) * $01000193) and $FFFFFFFF);
+  end;
+  Result := IntToHex(Hash, 8);
+end;
+
+function ProjectStateSection(const AProjectFile: string): string;
+begin
+  Result := 'Project.' + HashText32(DepTreeNormalizeFileKey(AProjectFile));
+end;
 
 { TDepTreeViewController }
 
@@ -107,6 +150,9 @@ begin
   FTree.OnDblClick := TreeDblClick;
   FTree.OnKeyDown := TreeKeyDown;
   FTree.OnHint := TreeHint;
+  FTree.OnChange := TreeSelectionChanged;
+  FTree.OnExpanded := TreeExpanded;
+  FTree.OnCollapsed := TreeCollapsed;
   FTree.OnMouseDown := TreeMouseDown;
 
   FPopupMenu := TPopupMenu.Create(nil);
@@ -135,6 +181,8 @@ end;
 
 destructor TDepTreeViewController.Destroy;
 begin
+  SaveTreeState;
+
   if FBuildTimer <> nil then
   begin
     FBuildTimer.Enabled := False;
@@ -146,6 +194,9 @@ begin
     FTree.OnDblClick := nil;
     FTree.OnKeyDown := nil;
     FTree.OnHint := nil;
+    FTree.OnChange := nil;
+    FTree.OnExpanded := nil;
+    FTree.OnCollapsed := nil;
     FTree.OnMouseDown := nil;
     FTree.PopupMenu := nil;
   end;
@@ -364,16 +415,21 @@ begin
 end;
 
 function TDepTreeViewController.NodePathKey(ANode: TTreeNode): string;
+var
+  Item: TDepTreeItem;
 begin
   Result := '';
-  while (ANode <> nil) and (ANode.Parent <> nil) do
+  if (ANode = nil) or (ANode.Parent = nil) then
+    Exit;
+
+  if ANode.Data <> nil then
   begin
-    if Result = '' then
-      Result := ANode.Text
-    else
-      Result := ANode.Text + '/' + Result;
-    ANode := ANode.Parent;
-  end;
+    Item := TDepTreeItem(ANode.Data);
+    if Item.FileName <> '' then
+      Result := 'file:' + DepTreeNormalizeFileKey(Item.FileName);
+  end
+  else
+    Result := 'dir:' + DepTreeNormalizeFileKey(NodeFolderPath(ANode));
 end;
 
 function TDepTreeViewController.NodeFolderPath(ANode: TTreeNode): string;
@@ -402,12 +458,14 @@ end;
 procedure TDepTreeViewController.CaptureExpandState(ANode: TTreeNode; AExpanded: TList<string>);
 var
   Index: Integer;
+  PathKey: string;
 begin
   if ANode = nil then
     Exit;
 
-  if ANode.Expanded then
-    AExpanded.Add(NodePathKey(ANode));
+  PathKey := NodePathKey(ANode);
+  if ANode.Expanded and (PathKey <> '') then
+    AExpanded.Add(PathKey);
   for Index := 0 to ANode.Count - 1 do
     CaptureExpandState(ANode.Item[Index], AExpanded);
 end;
@@ -425,17 +483,127 @@ begin
     RestoreExpandState(ANode.Item[Index], AExpanded);
 end;
 
+function TDepTreeViewController.FindNodeByPathKey(const APathKey: string): TTreeNode;
+var
+  Index: Integer;
+begin
+  Result := nil;
+  if APathKey = '' then
+    Exit;
+
+  for Index := 0 to FTree.Items.Count - 1 do
+  begin
+    if SameText(NodePathKey(FTree.Items[Index]), APathKey) then
+      Exit(FTree.Items[Index]);
+  end;
+end;
+
+procedure TDepTreeViewController.LoadTreeState(AExpanded: TList<string>;
+  out ASelectedPath: string);
+var
+  Ini: TMemIniFile;
+  FileName: string;
+  Section: string;
+  Count: Integer;
+  Index: Integer;
+  PathKey: string;
+begin
+  ASelectedPath := '';
+  if (AExpanded = nil) or (FProject.ProjectFile = '') then
+    Exit;
+
+  try
+    FileName := TreeStateFileName;
+    if not FileExists(FileName) then
+      Exit;
+
+    Ini := TMemIniFile.Create(FileName, TEncoding.UTF8);
+    try
+      Section := ProjectStateSection(FProject.ProjectFile);
+      Count := Ini.ReadInteger(Section, 'ExpandedCount', 0);
+      for Index := 0 to Count - 1 do
+      begin
+        PathKey := Ini.ReadString(Section, 'Expanded' + IntToStr(Index), '');
+        if PathKey <> '' then
+          AExpanded.Add(PathKey);
+      end;
+      ASelectedPath := Ini.ReadString(Section, 'Selected', '');
+    finally
+      Ini.Free;
+    end;
+  except
+    ASelectedPath := '';
+  end;
+end;
+
+procedure TDepTreeViewController.SaveTreeState;
+var
+  Ini: TMemIniFile;
+  ExpandedPaths: TList<string>;
+  FileName: string;
+  Section: string;
+  SelectedPath: string;
+  Index: Integer;
+begin
+  if FRestoringTreeState or (FTree = nil) or (FProject.ProjectFile = '') then
+    Exit;
+
+  try
+    FileName := TreeStateFileName;
+    ForceDirectories(ExtractFileDir(FileName));
+
+    ExpandedPaths := TList<string>.Create;
+    try
+      for Index := 0 to FTree.Items.Count - 1 do
+        if FTree.Items[Index].Parent = nil then
+          CaptureExpandState(FTree.Items[Index], ExpandedPaths);
+
+      SelectedPath := '';
+      if FTree.Selected <> nil then
+        SelectedPath := NodePathKey(FTree.Selected);
+      if (ExpandedPaths.Count = 0) and (SelectedPath = '') then
+        Exit;
+
+      Ini := TMemIniFile.Create(FileName, TEncoding.UTF8);
+      try
+        Section := ProjectStateSection(FProject.ProjectFile);
+        Ini.EraseSection(Section);
+        Ini.WriteString(Section, 'ProjectFile', FProject.ProjectFile);
+        Ini.WriteInteger(Section, 'ExpandedCount', ExpandedPaths.Count);
+        for Index := 0 to ExpandedPaths.Count - 1 do
+          Ini.WriteString(Section, 'Expanded' + IntToStr(Index), ExpandedPaths[Index]);
+        Ini.WriteString(Section, 'Selected', SelectedPath);
+        Ini.UpdateFile;
+      finally
+        Ini.Free;
+      end;
+    finally
+      ExpandedPaths.Free;
+    end;
+  except
+  end;
+end;
+
 procedure TDepTreeViewController.RebuildTree;
 var
   ExpandedPaths: TList<string>;
+  SelectedPath: string;
+  SelectedNode: TTreeNode;
   Index: Integer;
 begin
   ExpandedPaths := TList<string>.Create;
   try
+    SelectedPath := '';
+    if FTree.Selected <> nil then
+      SelectedPath := NodePathKey(FTree.Selected);
+
     for Index := 0 to FTree.Items.Count - 1 do
       if FTree.Items[Index].Parent = nil then
         CaptureExpandState(FTree.Items[Index], ExpandedPaths);
+    if (ExpandedPaths.Count = 0) and (SelectedPath = '') then
+      LoadTreeState(ExpandedPaths, SelectedPath);
 
+    FRestoringTreeState := True;
     FTree.Items.BeginUpdate;
     try
       FTree.Items.Clear;
@@ -452,7 +620,15 @@ begin
     for Index := 0 to FTree.Items.Count - 1 do
       if FTree.Items[Index].Parent = nil then
         RestoreExpandState(FTree.Items[Index], ExpandedPaths);
+
+    SelectedNode := FindNodeByPathKey(SelectedPath);
+    if SelectedNode <> nil then
+    begin
+      FTree.Selected := SelectedNode;
+      SelectedNode.MakeVisible;
+    end;
   finally
+    FRestoringTreeState := False;
     ExpandedPaths.Free;
   end;
 end;
@@ -680,6 +856,27 @@ begin
     Hint := Item.FileName
   else
     Hint := DepTreeNodeKindToString(Item.Kind);
+end;
+
+procedure TDepTreeViewController.TreeSelectionChanged(Sender: TObject; Node: TTreeNode);
+begin
+  if (Node = nil) or (Node.Parent = nil) then
+    Exit;
+  SaveTreeState;
+end;
+
+procedure TDepTreeViewController.TreeExpanded(Sender: TObject; Node: TTreeNode);
+begin
+  if (Node = nil) or (Node.Parent = nil) then
+    Exit;
+  SaveTreeState;
+end;
+
+procedure TDepTreeViewController.TreeCollapsed(Sender: TObject; Node: TTreeNode);
+begin
+  if (Node = nil) or (Node.Parent = nil) then
+    Exit;
+  SaveTreeState;
 end;
 
 procedure TDepTreeViewController.TreeMouseDown(Sender: TObject; Button: TMouseButton;
