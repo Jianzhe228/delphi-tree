@@ -1,0 +1,50 @@
+package DepTreeD120;
+
+{$R *.res}
+{$IFDEF IMPLICITBUILDING This IFDEF should not be used by users}
+{$ALIGN 8}
+{$ASSERTIONS ON}
+{$BOOLEVAL OFF}
+{$DEBUGINFO OFF}
+{$EXTENDEDSYNTAX ON}
+{$IMPORTEDDATA ON}
+{$IOCHECKS ON}
+{$LOCALSYMBOLS ON}
+{$LONGSTRINGS ON}
+{$OPENSTRINGS ON}
+{$OPTIMIZATION OFF}
+{$OVERFLOWCHECKS OFF}
+{$RANGECHECKS OFF}
+{$REFERENCEINFO ON}
+{$SAFEDIVIDE OFF}
+{$STACKFRAMES ON}
+{$TYPEDADDRESS OFF}
+{$VARSTRINGCHECKS ON}
+{$WRITEABLECONST OFF}
+{$MINENUMSIZE 1}
+{$IMAGEBASE $400000}
+{$DEFINE DEBUG}
+{$ENDIF IMPLICITBUILDING}
+{$DESCRIPTION 'Delphi Dependency Tree IDE plugin'}
+{$DESIGNONLY}
+{$IMPLICITBUILD OFF}
+
+requires
+  rtl,
+  vcl,
+  designide;
+
+contains
+  DepTree.Registration in '..\src\DepTree.Registration.pas',
+  DepTree.Model in '..\src\model\DepTree.Model.pas',
+  DepTree.UsesLexer in '..\src\model\DepTree.UsesLexer.pas',
+  DepTree.Resolver in '..\src\model\DepTree.Resolver.pas',
+  DepTree.ProjectAnalyzer in '..\src\model\DepTree.ProjectAnalyzer.pas',
+  DepTree.TreeBuilder in '..\src\model\DepTree.TreeBuilder.pas',
+  DepTree.OTAUtils in '..\src\ota\DepTree.OTAUtils.pas',
+  DepTree.Notifiers in '..\src\ota\DepTree.Notifiers.pas',
+  DepTree.DockForm in '..\src\ui\DepTree.DockForm.pas',
+  DepTree.Frame in '..\src\ui\DepTree.Frame.pas' {DepTreeFrame: TFrame},
+  DepTree.ViewController in '..\src\ui\DepTree.ViewController.pas';
+
+end.
