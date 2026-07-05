@@ -20,7 +20,7 @@ package DepTreeD110;
 {$TYPEDADDRESS OFF}
 {$VARSTRINGCHECKS ON}
 {$WRITEABLECONST OFF}
-{$DESCRIPTION 'Delphi Dependency Tree IDE plugin'}
+{$DESCRIPTION 'Delphi Project Source Tree IDE plugin'}
 {$DESIGNONLY}
 
 requires

@@ -105,9 +105,13 @@ type
 function DepTreeNodeKindToString(AKind: TDepTreeNodeKind): string;
 function DepTreeSectionToString(ASection: TDepTreeDependencySection): string;
 
+// Canonical case-insensitive key for a file path; every map that is keyed by
+// file name (graph nodes, parse cache, editor-text snapshots) must use this.
+function DepTreeNormalizeFileKey(const AFileName: string): string;
+
 implementation
 
-function NormalizeNodeFileName(const AFileName: string): string;
+function DepTreeNormalizeFileKey(const AFileName: string): string;
 begin
   if AFileName = '' then
     Exit('');
@@ -202,7 +206,7 @@ end;
 class function TDepTreeGraph.MakeNodeId(const AUnitName, AFileName: string): string;
 begin
   if Trim(AFileName) <> '' then
-    Result := 'file:' + NormalizeNodeFileName(AFileName)
+    Result := 'file:' + DepTreeNormalizeFileKey(AFileName)
   else
     Result := 'unit:' + AnsiLowerCase(Trim(AUnitName));
 end;

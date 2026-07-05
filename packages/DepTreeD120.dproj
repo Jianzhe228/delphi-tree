@@ -1,4 +1,4 @@
-﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
     <PropertyGroup>
         <ProjectGuid>{BFD888F3-6630-4A46-841F-768E57B5E08F}</ProjectGuid>
         <MainSource>DepTreeD120.dpk</MainSource>
@@ -48,7 +48,7 @@
         <GenDll>true</GenDll>
         <GenPackage>true</GenPackage>
         <SanitizedProjectName>DepTreeD120</SanitizedProjectName>
-        <DCC_Description>Delphi Dependency Tree IDE plugin</DCC_Description>
+        <DCC_Description>Delphi Project Source Tree IDE plugin</DCC_Description>
         <DesignOnlyPackage>true</DesignOnlyPackage>
         <DCC_OutputNeverBuildDcps>true</DCC_OutputNeverBuildDcps>
         <DCC_Namespace>Winapi;System;System.Win;Vcl;Xml;$(DCC_Namespace)</DCC_Namespace>

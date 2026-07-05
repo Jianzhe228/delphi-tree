@@ -1,0 +1,13 @@
+# Delphi compiler/build output
+*.dcu
+*.identcache
+*.dproj.local
+*.local
+*.dsk
+*.map
+*.drc
+*.stat
+__history/
+
+# Local Codex/MSBuild scratch output
+.codex-build/

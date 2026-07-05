@@ -4,13 +4,17 @@ interface
 
 uses
   System.SysUtils,
+  System.Generics.Collections,
   DepTree.Model;
 
 type
   TDepTreeNewFileKind = (nfVclForm, nfVclFrame, nfDataModule, nfUnit);
 
 function ReadActiveProjectInfo(out AProject: TDepTreeProjectInfo): Boolean;
-function ReadSourceText(const AFileName: string): string;
+// Captures the in-editor text of every open Pascal source into ATexts, keyed
+// by DepTreeNormalizeFileKey. Must be called on the IDE main thread; the
+// result can then be handed to a background graph build.
+procedure SnapshotOpenSourceTexts(ATexts: TDictionary<string, string>);
 function OpenFileInIDE(const AFileName: string; ALine: Integer = 0): Boolean;
 function CreateNewProjectFile(AKind: TDepTreeNewFileKind; const ATargetDir, AUnitName,
   AFormName: string; out AFileName: string): Boolean;
@@ -141,61 +145,75 @@ begin
   Result := True;
 end;
 
-function TryReadOpenSourceText(const AFileName: string; out ASource: string): Boolean;
+function IsPascalSourceFile(const AFileName: string): Boolean;
+var
+  Ext: string;
+begin
+  Ext := AnsiLowerCase(ExtractFileExt(AFileName));
+  Result := (Ext = '.pas') or (Ext = '.dpr') or (Ext = '.dpk');
+end;
+
+function ReadEditorText(const ASourceEditor: IOTASourceEditor): string;
 const
   ChunkSize = 8192;
 var
-  ModuleServices: IOTAModuleServices;
-  Module: IOTAModule;
-  SourceEditor: IOTASourceEditor;
   Reader: IOTAEditReader;
-  Index: Integer;
   Position: Integer;
   ReadCount: Integer;
   Buffer: array[0..ChunkSize - 1] of AnsiChar;
   Chunk: AnsiString;
 begin
-  Result := False;
-  ASource := '';
+  Result := '';
+  Reader := ASourceEditor.CreateReader;
+  Position := 0;
+  repeat
+    FillChar(Buffer, SizeOf(Buffer), 0);
+    ReadCount := Reader.GetText(Position, PAnsiChar(@Buffer[0]), SizeOf(Buffer));
+    if ReadCount > 0 then
+    begin
+      SetString(Chunk, PAnsiChar(@Buffer[0]), ReadCount);
+      Result := Result + string(Chunk);
+      Inc(Position, ReadCount);
+    end;
+  until ReadCount < SizeOf(Buffer);
+end;
+
+procedure SnapshotOpenSourceTexts(ATexts: TDictionary<string, string>);
+var
+  ModuleServices: IOTAModuleServices;
+  Module: IOTAModule;
+  SourceEditor: IOTASourceEditor;
+  ModuleIndex: Integer;
+  FileIndex: Integer;
+  FileName: string;
+begin
+  if ATexts = nil then
+    Exit;
 
   if not Supports(BorlandIDEServices, IOTAModuleServices, ModuleServices) then
     Exit;
 
-  Module := ModuleServices.FindModule(AFileName);
-  if Module = nil then
-    Exit;
-
-  for Index := 0 to Module.GetModuleFileCount - 1 do
+  for ModuleIndex := 0 to ModuleServices.ModuleCount - 1 do
   begin
-    if Supports(Module.GetModuleFileEditor(Index), IOTASourceEditor, SourceEditor) then
-    begin
-      Reader := SourceEditor.CreateReader;
-      Position := 0;
-      repeat
-        FillChar(Buffer, SizeOf(Buffer), 0);
-        ReadCount := Reader.GetText(Position, PAnsiChar(@Buffer[0]), SizeOf(Buffer));
-        if ReadCount > 0 then
-        begin
-          SetString(Chunk, PAnsiChar(@Buffer[0]), ReadCount);
-          ASource := ASource + string(Chunk);
-          Inc(Position, ReadCount);
-        end;
-      until ReadCount < SizeOf(Buffer);
+    Module := ModuleServices.Modules[ModuleIndex];
+    if Module = nil then
+      Continue;
 
-      Exit(True);
+    // Walk the module's file editors rather than trusting Module.FileName:
+    // a project module is named after its .dproj while its source editor
+    // holds the .dpr/.dpk text.
+    for FileIndex := 0 to Module.GetModuleFileCount - 1 do
+    begin
+      if not Supports(Module.GetModuleFileEditor(FileIndex), IOTASourceEditor, SourceEditor) then
+        Continue;
+
+      FileName := SourceEditor.FileName;
+      if (FileName = '') or not IsPascalSourceFile(FileName) then
+        Continue;
+
+      ATexts.AddOrSetValue(DepTreeNormalizeFileKey(FileName), ReadEditorText(SourceEditor));
     end;
   end;
-end;
-
-function ReadSourceText(const AFileName: string): string;
-begin
-  if TryReadOpenSourceText(AFileName, Result) then
-    Exit;
-
-  if FileExists(AFileName) then
-    Result := TFile.ReadAllText(AFileName, TEncoding.Default)
-  else
-    Result := '';
 end;
 
 function OpenFileInIDE(const AFileName: string; ALine: Integer): Boolean;
@@ -421,35 +439,76 @@ begin
   Result := True;
 end;
 
+function IsProjectMemberFile(const AProject: IOTAProject; const AFileName: string): Boolean;
+var
+  ProjectDir: string;
+  ModuleInfo: IOTAModuleInfo;
+  Index: Integer;
+begin
+  Result := False;
+  if (AProject = nil) or (AFileName = '') then
+    Exit;
+
+  ProjectDir := ExtractFileDir(ExpandFileName(AProject.FileName));
+  for Index := 0 to AProject.GetModuleCount - 1 do
+  begin
+    ModuleInfo := AProject.GetModule(Index);
+    if ModuleInfo = nil then
+      Continue;
+
+    if SameText(AbsoluteFromProjectDir(ProjectDir, ModuleInfo.FileName), AFileName) then
+      Exit(True);
+  end;
+end;
+
 function DeleteProjectFile(const AFileName: string): Boolean;
 var
   ModuleServices: IOTAModuleServices;
   Project: IOTAProject;
+  FileName: string;
+  Ext: string;
   FileOp: TSHFileOpStruct;
   NameBuffer: array[0..2047] of Char;
   DfmFileName: string;
   Paths: string;
 begin
   Result := False;
-  if (AFileName = '') or not FileExists(AFileName) then
+  if AFileName = '' then
     Exit;
 
-  if Supports(BorlandIDEServices, IOTAModuleServices, ModuleServices) then
-  begin
-    Project := ModuleServices.GetActiveProject;
-    if Project <> nil then
-      try
-        Project.RemoveFile(AFileName);
-      except
-        // Not fatal - still attempt to delete the physical file below, even
-        // if the file was not (or no longer) tracked by the project.
-      end;
+  FileName := ExpandFileName(AFileName);
+  if not FileExists(FileName) then
+    Exit;
+
+  // The tree can show units resolved from the search path that belong to
+  // other projects or shared libraries - only files that are explicit
+  // members of the active project may be deleted, and a project's main
+  // source (.dpr/.dpk) never.
+  Ext := AnsiLowerCase(ExtractFileExt(FileName));
+  if (Ext = '.dpr') or (Ext = '.dpk') or (Ext = '.dproj') then
+    Exit;
+
+  if not Supports(BorlandIDEServices, IOTAModuleServices, ModuleServices) then
+    Exit;
+
+  Project := ModuleServices.GetActiveProject;
+  if (Project = nil) or SameText(FileName, ExpandFileName(Project.FileName)) then
+    Exit;
+
+  if not IsProjectMemberFile(Project, FileName) then
+    Exit;
+
+  try
+    Project.RemoveFile(FileName);
+  except
+    // Not fatal - membership was verified above, so still delete the
+    // physical file rather than silently ignoring the action.
   end;
 
   // pFrom is a double-null-terminated list; include the paired .dfm (if any)
   // so deleting a form/frame/data module does not leave an orphaned form file.
-  Paths := AFileName;
-  DfmFileName := ChangeFileExt(AFileName, '.dfm');
+  Paths := FileName;
+  DfmFileName := ChangeFileExt(FileName, '.dfm');
   if FileExists(DfmFileName) then
     Paths := Paths + #0 + DfmFileName;
   if Length(Paths) > High(NameBuffer) - 1 then

@@ -69,7 +69,7 @@ begin
     ParentMenu := MainMenu.Items;
 
   GMenuItem := TMenuItem.Create(nil);
-  GMenuItem.Caption := 'Dependency Tree';
+  GMenuItem.Caption := 'Project Source Tree';
   GMenuHandler := TDepTreeMenuHandler.Create;
   GMenuItem.OnClick := GMenuHandler.MenuClick;
   ParentMenu.Add(GMenuItem);

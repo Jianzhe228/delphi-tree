@@ -38,7 +38,7 @@
         <GenDll>true</GenDll>
         <GenPackage>true</GenPackage>
         <SanitizedProjectName>DepTreeD110</SanitizedProjectName>
-        <DCC_Description>Delphi Dependency Tree IDE plugin</DCC_Description>
+        <DCC_Description>Delphi Project Source Tree IDE plugin</DCC_Description>
         <DesignOnlyPackage>true</DesignOnlyPackage>
         <DCC_OutputNeverBuildDcps>true</DCC_OutputNeverBuildDcps>
         <DCC_Namespace>Winapi;System;System.Win;Vcl;Xml;$(DCC_Namespace)</DCC_Namespace>

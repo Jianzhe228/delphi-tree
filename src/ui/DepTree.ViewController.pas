@@ -10,6 +10,7 @@ uses
   Vcl.ComCtrls,
   Vcl.Menus,
   DepTree.Model,
+  DepTree.ProjectAnalyzer,
   DepTree.TreeBuilder;
 
 type
@@ -19,6 +20,10 @@ type
     FGraph: TDepTreeGraph;
     FItems: TObjectList<TDepTreeItem>;
     FProject: TDepTreeProjectInfo;
+    FMemberFiles: TDictionary<string, Boolean>;
+    FParseCache: TDepTreeParseCache;
+    FBuildThread: TDepTreeGraphBuildThread;
+    FPendingRefresh: Boolean;
     FHideExternal: Boolean;
     FLastStatus: string;
     FOnStatusChanged: TNotifyEvent;
@@ -26,6 +31,12 @@ type
     FNewMenuItem: TMenuItem;
     FDeleteMenuItem: TMenuItem;
 
+    procedure StartBuild;
+    procedure BuildProgress(Sender: TObject);
+    procedure BuildFinished(Sender: TObject);
+    procedure RebuildMemberIndex;
+    function IsProjectMember(const AFileName: string): Boolean;
+    function CanDeleteFile(const AFileName: string): Boolean;
     procedure AddTreeNode(AParent: TTreeNode; AItem: TDepTreeItem);
     procedure ClearTree;
     procedure RebuildTree;
@@ -63,7 +74,6 @@ uses
   Winapi.Windows,
   System.Generics.Defaults,
   Vcl.Dialogs,
-  DepTree.ProjectAnalyzer,
   DepTree.OTAUtils,
   DepTree.ShellIcons;
 
@@ -80,6 +90,8 @@ begin
   inherited Create;
   FTree := ATree;
   FItems := TObjectList<TDepTreeItem>.Create(True);
+  FMemberFiles := TDictionary<string, Boolean>.Create;
+  FParseCache := TDepTreeParseCache.Create;
   FHideExternal := True;
 
   FTree.ReadOnly := True;
@@ -115,9 +127,24 @@ end;
 
 destructor TDepTreeViewController.Destroy;
 begin
+  if FBuildThread <> nil then
+  begin
+    // Detach the events first so nothing calls back into this (dying) object,
+    // then wait the thread out. Cancellation is polled per parsed file, so the
+    // wait is normally short.
+    FBuildThread.OnTerminate := nil;
+    FBuildThread.OnProgress := nil;
+    FBuildThread.Cancel;
+    FBuildThread.WaitFor;
+    TThread.RemoveQueuedEvents(FBuildThread);
+    FreeAndNil(FBuildThread);
+  end;
+
   FPopupMenu.Free;
   FGraph.Free;
   FItems.Free;
+  FMemberFiles.Free;
+  FParseCache.Free;
   inherited;
 end;
 
@@ -133,38 +160,167 @@ begin
 end;
 
 procedure TDepTreeViewController.RefreshFromIDE;
-var
-  Root: TTreeNode;
 begin
-  FreeAndNil(FGraph);
-  FProject := Default(TDepTreeProjectInfo);
-
-  if not ReadActiveProjectInfo(FProject) then
+  // A build is already running: cancel it and start over once it has ended.
+  // This coalesces bursts of refresh requests (IDE notifiers, button mashing)
+  // into a single up-to-date rebuild.
+  if FBuildThread <> nil then
   begin
-    ClearTree;
-    Root := FTree.Items.Add(nil, 'No active Delphi project');
-    Root.StateIndex := -1;
-    FLastStatus := 'No active Delphi project.';
+    FPendingRefresh := True;
+    FBuildThread.Cancel;
     Exit;
   end;
 
+  StartBuild;
+end;
+
+procedure TDepTreeViewController.StartBuild;
+var
+  Project: TDepTreeProjectInfo;
+  OpenTexts: TDictionary<string, string>;
+  Thread: TDepTreeGraphBuildThread;
+  Root: TTreeNode;
+begin
+  Project := Default(TDepTreeProjectInfo);
+  if not ReadActiveProjectInfo(Project) then
+  begin
+    FreeAndNil(FGraph);
+    FProject := Default(TDepTreeProjectInfo);
+    RebuildMemberIndex;
+    ClearTree;
+    Root := FTree.Items.Add(nil, 'No active Delphi project');
+    Root.StateIndex := -1;
+    SetStatus('No active Delphi project.');
+    Exit;
+  end;
+
+  // Everything ToolsAPI-related is gathered here, on the main thread; the
+  // build thread then only touches the snapshot and the file system. The old
+  // tree stays visible until the new graph arrives in BuildFinished.
+  Thread := nil;
+  OpenTexts := TDictionary<string, string>.Create;
   try
-    FGraph := TDepTreeProjectAnalyzer.BuildGraph(
-      FProject,
-      function(const AFileName: string): string
-      begin
-        Result := ReadSourceText(AFileName);
-      end);
-    RebuildTree;
-    FLastStatus := Format('Loaded %s.', [FProject.ProjectName]);
+    SnapshotOpenSourceTexts(OpenTexts);
+    Thread := TDepTreeGraphBuildThread.Create(Project, OpenTexts, FParseCache);
+    OpenTexts := nil;
+    Thread.OnProgress := BuildProgress;
+    Thread.OnTerminate := BuildFinished;
+    FBuildThread := Thread;
+    Thread := nil;
+    FBuildThread.Start;
   except
     on E: Exception do
     begin
-      ClearTree;
-      FTree.Items.Add(nil, 'Dependency analysis failed: ' + E.Message);
-      FLastStatus := E.Message;
+      FreeAndNil(FBuildThread);
+      Thread.Free;
+      OpenTexts.Free;
+      SetStatus('Could not start analysis: ' + E.Message);
+      Exit;
     end;
   end;
+  SetStatus(Format('Analyzing %s...', [Project.ProjectName]));
+end;
+
+procedure TDepTreeViewController.BuildProgress(Sender: TObject);
+begin
+  if Sender <> FBuildThread then
+    Exit;
+
+  SetStatus(Format('Analyzing %s... (%d files)',
+    [FBuildThread.ProjectInfo.ProjectName, FBuildThread.ParsedCount]));
+end;
+
+procedure TDepTreeViewController.BuildFinished(Sender: TObject);
+var
+  Thread: TDepTreeGraphBuildThread;
+  Graph: TDepTreeGraph;
+  ProjectInfo: TDepTreeProjectInfo;
+  Error: string;
+  WasCancelled: Boolean;
+begin
+  Thread := TDepTreeGraphBuildThread(Sender);
+  if Thread <> FBuildThread then
+    Exit;
+
+  FBuildThread := nil;
+  Graph := Thread.DetachGraph;
+  ProjectInfo := Thread.ProjectInfo;
+  Error := Thread.Error;
+  WasCancelled := Thread.Cancelled;
+  TThread.RemoveQueuedEvents(Thread);
+  TThread.ForceQueue(nil,
+    procedure
+    begin
+      Thread.Free;
+    end);
+
+  if FPendingRefresh then
+  begin
+    FPendingRefresh := False;
+    Graph.Free;
+    StartBuild;
+    Exit;
+  end;
+
+  if WasCancelled then
+  begin
+    Graph.Free;
+    SetStatus('Analysis cancelled.');
+    Exit;
+  end;
+
+  if Error <> '' then
+  begin
+    Graph.Free;
+    FreeAndNil(FGraph);
+    FProject := Default(TDepTreeProjectInfo);
+    RebuildMemberIndex;
+    ClearTree;
+    FTree.Items.Add(nil, 'Analysis failed: ' + Error);
+    SetStatus(Error);
+    Exit;
+  end;
+
+  FreeAndNil(FGraph);
+  FGraph := Graph;
+  FProject := ProjectInfo;
+  RebuildMemberIndex;
+  RebuildTree;
+  SetStatus(Format('Loaded %s.', [FProject.ProjectName]));
+end;
+
+procedure TDepTreeViewController.RebuildMemberIndex;
+var
+  FileName: string;
+begin
+  FMemberFiles.Clear;
+  for FileName in FProject.SourceFiles do
+    FMemberFiles.AddOrSetValue(DepTreeNormalizeFileKey(FileName), True);
+end;
+
+function TDepTreeViewController.IsProjectMember(const AFileName: string): Boolean;
+begin
+  Result := (AFileName <> '') and FMemberFiles.ContainsKey(DepTreeNormalizeFileKey(AFileName));
+end;
+
+function TDepTreeViewController.CanDeleteFile(const AFileName: string): Boolean;
+var
+  Ext: string;
+begin
+  Result := False;
+  if AFileName = '' then
+    Exit;
+
+  // Only explicit project members may be deleted - the graph also contains
+  // shared units resolved from the search path. Main sources are off-limits
+  // entirely.
+  Ext := AnsiLowerCase(ExtractFileExt(AFileName));
+  if (Ext = '.dpr') or (Ext = '.dpk') or (Ext = '.dproj') then
+    Exit;
+  if SameText(AFileName, FProject.MainSource) or SameText(AFileName, FProject.ProjectFile) then
+    Exit;
+
+  Result := IsProjectMember(AFileName);
 end;
 
 function TDepTreeViewController.NodePathKey(ANode: TTreeNode): string;
@@ -500,8 +656,13 @@ begin
 end;
 
 procedure TDepTreeViewController.PopupMenuPopup(Sender: TObject);
+var
+  Item: TDepTreeItem;
 begin
-  FDeleteMenuItem.Enabled := (FTree.Selected <> nil) and (FTree.Selected.Data <> nil);
+  Item := nil;
+  if (FTree.Selected <> nil) and (FTree.Selected.Data <> nil) then
+    Item := TDepTreeItem(FTree.Selected.Data);
+  FDeleteMenuItem.Enabled := (Item <> nil) and CanDeleteFile(Item.FileName);
 end;
 
 procedure TDepTreeViewController.NewFileClick(Sender: TObject);
@@ -585,6 +746,11 @@ begin
   Item := TDepTreeItem(FTree.Selected.Data);
   if Item.FileName = '' then
     Exit;
+  if not CanDeleteFile(Item.FileName) then
+  begin
+    SetStatus('Only explicit project units can be deleted.');
+    Exit;
+  end;
 
   Description := ExtractFileName(Item.FileName);
   if FileExists(ChangeFileExt(Item.FileName, '.dfm')) then

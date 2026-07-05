@@ -1,12 +1,12 @@
-delphi 项目树插件
+delphi 项目源码树插件
 
 1. 使用delphi打开对应版本的dproj
 2. 编译
 3. 点击component->install packages->add
 4. 选择C:\Users\Public\Documents\Embarcadero\Studio\23.0\Bpl\DepTreeD120.bpl(可能在其他路径，视具体版本而定)
-5. 确认delphi dependency tree ide plugin已经勾选
+5. 确认delphi project source tree ide plugin已经勾选
 6. 保存，重启delphi
-7. view->dependency tree打开视图
+7. view->project source tree打开视图
 
 效果图
 

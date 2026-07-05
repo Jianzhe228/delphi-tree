@@ -54,7 +54,7 @@ var
 
 function TDepTreeDockableForm.GetCaption: string;
 begin
-  Result := 'Dependency Tree';
+  Result := 'Project Source Tree';
 end;
 
 function TDepTreeDockableForm.GetIdentifier: string;
@@ -191,7 +191,7 @@ begin
     end;
   except
     on E: Exception do
-      MessageDlg('Dependency Tree failed to open: ' + E.Message, mtError, [mbOK], 0);
+      MessageDlg('Project Source Tree failed to open: ' + E.Message, mtError, [mbOK], 0);
   end;
 end;
 
