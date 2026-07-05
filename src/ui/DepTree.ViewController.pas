@@ -6,7 +6,9 @@ uses
   System.SysUtils,
   System.Classes,
   System.Generics.Collections,
+  Vcl.Controls,
   Vcl.ComCtrls,
+  Vcl.Menus,
   DepTree.Model,
   DepTree.TreeBuilder;
 
@@ -20,6 +22,9 @@ type
     FHideExternal: Boolean;
     FLastStatus: string;
     FOnStatusChanged: TNotifyEvent;
+    FPopupMenu: TPopupMenu;
+    FNewMenuItem: TMenuItem;
+    FDeleteMenuItem: TMenuItem;
 
     procedure AddTreeNode(AParent: TTreeNode; AItem: TDepTreeItem);
     procedure ClearTree;
@@ -27,6 +32,7 @@ type
     procedure RebuildContainsTree;
     function NodeSortText(ANode: TDepTreeNode): string;
     function NodePathKey(ANode: TTreeNode): string;
+    function NodeFolderPath(ANode: TTreeNode): string;
     procedure CaptureExpandState(ANode: TTreeNode; AExpanded: TList<string>);
     procedure RestoreExpandState(ANode: TTreeNode; AExpanded: TList<string>);
     procedure SetStatus(const AStatus: string);
@@ -34,6 +40,11 @@ type
     procedure TreeDblClick(Sender: TObject);
     procedure TreeKeyDown(Sender: TObject; var Key: Word; Shift: TShiftState);
     procedure TreeHint(Sender: TObject; const Node: TTreeNode; var Hint: string);
+    procedure TreeMouseDown(Sender: TObject; Button: TMouseButton;
+      Shift: TShiftState; X, Y: Integer);
+    procedure PopupMenuPopup(Sender: TObject);
+    procedure NewFileClick(Sender: TObject);
+    procedure DeleteClick(Sender: TObject);
   public
     constructor Create(ATree: TTreeView);
     destructor Destroy; override;
@@ -51,6 +62,7 @@ implementation
 uses
   Winapi.Windows,
   System.Generics.Defaults,
+  Vcl.Dialogs,
   DepTree.ProjectAnalyzer,
   DepTree.OTAUtils,
   DepTree.ShellIcons;
@@ -58,6 +70,12 @@ uses
 { TDepTreeViewController }
 
 constructor TDepTreeViewController.Create(ATree: TTreeView);
+const
+  CNewFileCaptions: array[TDepTreeNewFileKind] of string =
+    ('VCL Form...', 'VCL Frame...', 'Data Module...', 'Unit...');
+var
+  Kind: TDepTreeNewFileKind;
+  KindItem: TMenuItem;
 begin
   inherited Create;
   FTree := ATree;
@@ -69,10 +87,35 @@ begin
   FTree.OnDblClick := TreeDblClick;
   FTree.OnKeyDown := TreeKeyDown;
   FTree.OnHint := TreeHint;
+  FTree.OnMouseDown := TreeMouseDown;
+
+  FPopupMenu := TPopupMenu.Create(nil);
+  FPopupMenu.OnPopup := PopupMenuPopup;
+
+  FNewMenuItem := TMenuItem.Create(nil);
+  FNewMenuItem.Caption := 'New';
+  FPopupMenu.Items.Add(FNewMenuItem);
+
+  for Kind := Low(TDepTreeNewFileKind) to High(TDepTreeNewFileKind) do
+  begin
+    KindItem := TMenuItem.Create(nil);
+    KindItem.Caption := CNewFileCaptions[Kind];
+    KindItem.Tag := Ord(Kind);
+    KindItem.OnClick := NewFileClick;
+    FNewMenuItem.Add(KindItem);
+  end;
+
+  FDeleteMenuItem := TMenuItem.Create(nil);
+  FDeleteMenuItem.Caption := 'Delete';
+  FDeleteMenuItem.OnClick := DeleteClick;
+  FPopupMenu.Items.Add(FDeleteMenuItem);
+
+  FTree.PopupMenu := FPopupMenu;
 end;
 
 destructor TDepTreeViewController.Destroy;
 begin
+  FPopupMenu.Free;
   FGraph.Free;
   FItems.Free;
   inherited;
@@ -135,6 +178,29 @@ begin
       Result := ANode.Text + '/' + Result;
     ANode := ANode.Parent;
   end;
+end;
+
+function TDepTreeViewController.NodeFolderPath(ANode: TTreeNode): string;
+var
+  RelativePath: string;
+begin
+  if (ANode <> nil) and (ANode.Data <> nil) then
+    Exit(ExtractFileDir(TDepTreeItem(ANode.Data).FileName));
+
+  RelativePath := '';
+  while (ANode <> nil) and (ANode.Parent <> nil) do
+  begin
+    if RelativePath = '' then
+      RelativePath := ANode.Text
+    else
+      RelativePath := ANode.Text + PathDelim + RelativePath;
+    ANode := ANode.Parent;
+  end;
+
+  if RelativePath = '' then
+    Result := FProject.ProjectDir
+  else
+    Result := ExpandFileName(IncludeTrailingPathDelimiter(FProject.ProjectDir) + RelativePath);
 end;
 
 procedure TDepTreeViewController.CaptureExpandState(ANode: TTreeNode; AExpanded: TList<string>);
@@ -418,6 +484,121 @@ begin
     Hint := Item.FileName
   else
     Hint := DepTreeNodeKindToString(Item.Kind);
+end;
+
+procedure TDepTreeViewController.TreeMouseDown(Sender: TObject; Button: TMouseButton;
+  Shift: TShiftState; X, Y: Integer);
+var
+  Node: TTreeNode;
+begin
+  if Button = mbRight then
+  begin
+    Node := FTree.GetNodeAt(X, Y);
+    if Node <> nil then
+      FTree.Selected := Node;
+  end;
+end;
+
+procedure TDepTreeViewController.PopupMenuPopup(Sender: TObject);
+begin
+  FDeleteMenuItem.Enabled := (FTree.Selected <> nil) and (FTree.Selected.Data <> nil);
+end;
+
+procedure TDepTreeViewController.NewFileClick(Sender: TObject);
+const
+  CTitles: array[TDepTreeNewFileKind] of string =
+    ('New VCL Form', 'New VCL Frame', 'New Data Module', 'New Unit');
+  CNamePrompts: array[TDepTreeNewFileKind] of string =
+    ('Form name:', 'Frame name:', 'Data module name:', '');
+  CDefaultNames: array[TDepTreeNewFileKind] of string =
+    ('Form1', 'Frame1', 'DataModule1', '');
+var
+  Kind: TDepTreeNewFileKind;
+  TargetDir: string;
+  UnitName: string;
+  FormName: string;
+  NewFileName: string;
+  Values: array[0..1] of string;
+begin
+  Kind := TDepTreeNewFileKind(TMenuItem(Sender).Tag);
+  TargetDir := NodeFolderPath(FTree.Selected);
+
+  if Kind = nfUnit then
+  begin
+    UnitName := 'Unit1';
+    FormName := '';
+    if not InputQuery(CTitles[Kind], 'Unit name:', UnitName) then
+      Exit;
+  end
+  else
+  begin
+    Values[0] := 'Unit1';
+    Values[1] := CDefaultNames[Kind];
+    if not InputQuery(CTitles[Kind], ['Unit name:', CNamePrompts[Kind]], Values) then
+      Exit;
+    UnitName := Values[0];
+    FormName := Values[1];
+  end;
+
+  UnitName := Trim(UnitName);
+  if not IsValidIdent(UnitName, True) then
+  begin
+    SetStatus('Invalid unit name: ' + UnitName);
+    Exit;
+  end;
+
+  if Kind <> nfUnit then
+  begin
+    FormName := Trim(FormName);
+    if not IsValidIdent(FormName) then
+    begin
+      SetStatus('Invalid name: ' + FormName);
+      Exit;
+    end;
+    // The generated class ("T" + name) and variable would collide with the
+    // unit's own identifier (E2004).
+    if SameText(FormName, UnitName) or SameText('T' + FormName, UnitName) then
+    begin
+      SetStatus('The name must differ from the unit name: ' + FormName);
+      Exit;
+    end;
+  end;
+
+  if not CreateNewProjectFile(Kind, TargetDir, UnitName, FormName, NewFileName) then
+  begin
+    SetStatus('Could not create ' + UnitName + '.pas - it may already exist there.');
+    Exit;
+  end;
+
+  RefreshFromIDE;
+  OpenFileInIDE(NewFileName);
+end;
+
+procedure TDepTreeViewController.DeleteClick(Sender: TObject);
+var
+  Item: TDepTreeItem;
+  Description: string;
+begin
+  if (FTree.Selected = nil) or (FTree.Selected.Data = nil) then
+    Exit;
+
+  Item := TDepTreeItem(FTree.Selected.Data);
+  if Item.FileName = '' then
+    Exit;
+
+  Description := ExtractFileName(Item.FileName);
+  if FileExists(ChangeFileExt(Item.FileName, '.dfm')) then
+    Description := Description + ' (and its .dfm)';
+
+  if MessageDlg('Delete ' + Description +
+    '?'#13#10#13#10'The file(s) will be removed from the project and sent to the Recycle Bin.',
+    mtWarning, [mbYes, mbNo], 0) <> mrYes then
+    Exit;
+
+  if DeleteProjectFile(Item.FileName) then
+    RefreshFromIDE
+  else
+    SetStatus('Could not delete: ' + Item.FileName);
 end;
 
 procedure TDepTreeViewController.SetHideExternal(AHideExternal: Boolean);
