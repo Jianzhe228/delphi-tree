@@ -16,6 +16,7 @@ uses
   Winapi.ShellAPI,
   System.SysUtils,
   System.Generics.Collections,
+  Vcl.Forms,
   Vcl.Graphics;
 
 const
@@ -30,7 +31,7 @@ function EnsureImageList: TImageList;
 begin
   if GImageList = nil then
   begin
-    GImageList := TImageList.Create(nil);
+    GImageList := TImageList.Create(Application);
     GImageList.Width := IconSize;
     GImageList.Height := IconSize;
   end;
@@ -115,7 +116,7 @@ end;
 initialization
 
 finalization
-  GIconIndexByKey.Free;
-  GImageList.Free;
+  FreeAndNil(GIconIndexByKey);
+  GImageList := nil;
 
 end.

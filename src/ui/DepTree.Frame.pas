@@ -53,6 +53,14 @@ end;
 
 destructor TDepTreeFrame.Destroy;
 begin
+  if FRefreshButton <> nil then
+    FRefreshButton.OnClick := nil;
+  if FHideExternalCheck <> nil then
+    FHideExternalCheck.OnClick := nil;
+  if FTree <> nil then
+    FTree.Images := nil;
+  if FController <> nil then
+    FController.OnStatusChanged := nil;
   FController.Free;
   inherited;
 end;

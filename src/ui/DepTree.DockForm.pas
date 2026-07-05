@@ -12,6 +12,7 @@ implementation
 
 uses
   System.SysUtils,
+  System.Classes,
   System.IniFiles,
   Vcl.ActnList,
   Vcl.Forms,
@@ -25,7 +26,9 @@ uses
   DepTree.Frame;
 
 type
-  TDepTreeDockableForm = class(TInterfacedObject, INTACustomDockableForm)
+  TDepTreeDockableForm = class(TComponent, INTACustomDockableForm)
+  protected
+    procedure Notification(AComponent: TComponent; Operation: TOperation); override;
   public
     function GetCaption: string;
     function GetIdentifier: string;
@@ -42,7 +45,6 @@ type
       IsProject: Boolean);
     function GetEditState: TEditState;
     function EditAction(Action: TEditAction): Boolean;
-    procedure HostDestroyed(Sender: TObject);
   end;
 
 var
@@ -50,7 +52,6 @@ var
   GDockFormObj: TDepTreeDockableForm;
   GDockHost: TForm;
   GFrame: TDepTreeFrame;
-  GRegistered: Boolean;
 
 function TDepTreeDockableForm.GetCaption: string;
 begin
@@ -121,46 +122,51 @@ begin
   Result := False;
 end;
 
-procedure TDepTreeDockableForm.HostDestroyed(Sender: TObject);
+procedure TDepTreeDockableForm.Notification(AComponent: TComponent;
+  Operation: TOperation);
 begin
+  inherited;
+  if (Operation = opRemove) and (AComponent = GDockHost) then
+  begin
+    GDockHost := nil;
+    GFrame := nil;
+  end;
+end;
+
+procedure DetachDockHost;
+var
+  Host: TForm;
+begin
+  Host := GDockHost;
   GDockHost := nil;
   GFrame := nil;
+
+  if Host = nil then
+    Exit;
+
+  if GDockFormObj <> nil then
+    Host.RemoveFreeNotification(GDockFormObj);
 end;
 
 procedure EnsureDockFormObject;
 begin
   if GDockForm = nil then
   begin
-    GDockFormObj := TDepTreeDockableForm.Create;
+    GDockFormObj := TDepTreeDockableForm.Create(nil);
     GDockForm := GDockFormObj;
   end;
 end;
 
 procedure RegisterDepTreeDockForm;
-var
-  NTAServices: INTAServices;
 begin
-  if GRegistered then
-    Exit;
-
-  if not Supports(BorlandIDEServices, INTAServices, NTAServices) then
-    Exit;
-
-  EnsureDockFormObject;
-  NTAServices.RegisterDockableForm(GDockForm);
-  GRegistered := True;
+  // Desktop-state registration is intentionally avoided. The IDE can create
+  // and release registered dockable forms during shutdown, which makes package
+  // finalization order fragile. We create the tool window explicitly instead.
 end;
 
 procedure UnregisterDepTreeDockForm;
-var
-  NTAServices: INTAServices;
 begin
-  if not GRegistered then
-    Exit;
-
-  if Supports(BorlandIDEServices, INTAServices, NTAServices) then
-    NTAServices.UnregisterDockableForm(GDockForm);
-  GRegistered := False;
+  DetachDockHost;
 end;
 
 procedure EnsureDockForm;
@@ -176,7 +182,7 @@ begin
   EnsureDockFormObject;
   GDockHost := NTAServices.CreateDockableForm(GDockForm) as TForm;
   if GDockHost <> nil then
-    GDockHost.OnDestroy := GDockFormObj.HostDestroyed;
+    GDockHost.FreeNotification(GDockFormObj);
 end;
 
 procedure ShowDepTreeWindow;
@@ -215,10 +221,13 @@ end;
 initialization
 
 finalization
-  UnregisterDepTreeDockForm;
-  GFrame := nil;
-  GDockHost := nil;
-  GDockForm := nil;
-  GDockFormObj := nil;
+  try
+    UnregisterDepTreeDockForm;
+    GDockForm := nil;
+    // The IDE may still release cached interface references during shutdown.
+    // Leaving this tiny helper allocated avoids a finalization-time double free.
+    GDockFormObj := nil;
+  except
+  end;
 
 end.

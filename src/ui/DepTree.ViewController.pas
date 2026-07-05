@@ -8,6 +8,7 @@ uses
   System.Generics.Collections,
   Vcl.Controls,
   Vcl.ComCtrls,
+  Vcl.ExtCtrls,
   Vcl.Menus,
   DepTree.Model,
   DepTree.ProjectAnalyzer,
@@ -23,6 +24,8 @@ type
     FMemberFiles: TDictionary<string, Boolean>;
     FParseCache: TDepTreeParseCache;
     FBuildThread: TDepTreeGraphBuildThread;
+    FBuildTimer: TTimer;
+    FLastReportedParsedCount: Integer;
     FPendingRefresh: Boolean;
     FHideExternal: Boolean;
     FLastStatus: string;
@@ -32,8 +35,8 @@ type
     FDeleteMenuItem: TMenuItem;
 
     procedure StartBuild;
-    procedure BuildProgress(Sender: TObject);
-    procedure BuildFinished(Sender: TObject);
+    procedure BuildTimerTick(Sender: TObject);
+    procedure FinishBuild;
     procedure RebuildMemberIndex;
     function IsProjectMember(const AFileName: string): Boolean;
     function CanDeleteFile(const AFileName: string): Boolean;
@@ -94,6 +97,11 @@ begin
   FParseCache := TDepTreeParseCache.Create;
   FHideExternal := True;
 
+  FBuildTimer := TTimer.Create(nil);
+  FBuildTimer.Enabled := False;
+  FBuildTimer.Interval := 150;
+  FBuildTimer.OnTimer := BuildTimerTick;
+
   FTree.ReadOnly := True;
   FTree.HideSelection := False;
   FTree.OnDblClick := TreeDblClick;
@@ -127,19 +135,40 @@ end;
 
 destructor TDepTreeViewController.Destroy;
 begin
+  if FBuildTimer <> nil then
+  begin
+    FBuildTimer.Enabled := False;
+    FBuildTimer.OnTimer := nil;
+  end;
+
+  if FTree <> nil then
+  begin
+    FTree.OnDblClick := nil;
+    FTree.OnKeyDown := nil;
+    FTree.OnHint := nil;
+    FTree.OnMouseDown := nil;
+    FTree.PopupMenu := nil;
+  end;
+  if FPopupMenu <> nil then
+    FPopupMenu.OnPopup := nil;
+  if FNewMenuItem <> nil then
+    FNewMenuItem.OnClick := nil;
+  if FDeleteMenuItem <> nil then
+    FDeleteMenuItem.OnClick := nil;
+
   if FBuildThread <> nil then
   begin
-    // Detach the events first so nothing calls back into this (dying) object,
-    // then wait the thread out. Cancellation is polled per parsed file, so the
-    // wait is normally short.
-    FBuildThread.OnTerminate := nil;
-    FBuildThread.OnProgress := nil;
+    // Cancellation is polled per parsed file, so the wait is normally short.
     FBuildThread.Cancel;
     FBuildThread.WaitFor;
     TThread.RemoveQueuedEvents(FBuildThread);
     FreeAndNil(FBuildThread);
   end;
 
+  if FTree <> nil then
+    FTree.Items.Clear;
+
+  FBuildTimer.Free;
   FPopupMenu.Free;
   FGraph.Free;
   FItems.Free;
@@ -196,18 +225,18 @@ begin
 
   // Everything ToolsAPI-related is gathered here, on the main thread; the
   // build thread then only touches the snapshot and the file system. The old
-  // tree stays visible until the new graph arrives in BuildFinished.
+  // tree stays visible until the timer observes the finished graph.
   Thread := nil;
   OpenTexts := TDictionary<string, string>.Create;
   try
     SnapshotOpenSourceTexts(OpenTexts);
     Thread := TDepTreeGraphBuildThread.Create(Project, OpenTexts, FParseCache);
     OpenTexts := nil;
-    Thread.OnProgress := BuildProgress;
-    Thread.OnTerminate := BuildFinished;
     FBuildThread := Thread;
     Thread := nil;
     FBuildThread.Start;
+    FLastReportedParsedCount := -1;
+    FBuildTimer.Enabled := True;
   except
     on E: Exception do
     begin
@@ -221,16 +250,29 @@ begin
   SetStatus(Format('Analyzing %s...', [Project.ProjectName]));
 end;
 
-procedure TDepTreeViewController.BuildProgress(Sender: TObject);
+procedure TDepTreeViewController.BuildTimerTick(Sender: TObject);
 begin
-  if Sender <> FBuildThread then
+  if FBuildThread = nil then
+  begin
+    FBuildTimer.Enabled := False;
     Exit;
+  end;
 
-  SetStatus(Format('Analyzing %s... (%d files)',
-    [FBuildThread.ProjectInfo.ProjectName, FBuildThread.ParsedCount]));
+  if FBuildThread.Finished then
+  begin
+    FinishBuild;
+    Exit;
+  end;
+
+  if FBuildThread.ParsedCount <> FLastReportedParsedCount then
+  begin
+    FLastReportedParsedCount := FBuildThread.ParsedCount;
+    SetStatus(Format('Analyzing %s... (%d files)',
+      [FBuildThread.ProjectInfo.ProjectName, FBuildThread.ParsedCount]));
+  end;
 end;
 
-procedure TDepTreeViewController.BuildFinished(Sender: TObject);
+procedure TDepTreeViewController.FinishBuild;
 var
   Thread: TDepTreeGraphBuildThread;
   Graph: TDepTreeGraph;
@@ -238,21 +280,19 @@ var
   Error: string;
   WasCancelled: Boolean;
 begin
-  Thread := TDepTreeGraphBuildThread(Sender);
-  if Thread <> FBuildThread then
+  Thread := FBuildThread;
+  if Thread = nil then
     Exit;
 
+  FBuildTimer.Enabled := False;
   FBuildThread := nil;
+  Thread.WaitFor;
   Graph := Thread.DetachGraph;
   ProjectInfo := Thread.ProjectInfo;
   Error := Thread.Error;
   WasCancelled := Thread.Cancelled;
   TThread.RemoveQueuedEvents(Thread);
-  TThread.ForceQueue(nil,
-    procedure
-    begin
-      Thread.Free;
-    end);
+  Thread.Free;
 
   if FPendingRefresh then
   begin

@@ -52,7 +52,7 @@ type
 
   // Runs BuildGraph off the IDE main thread. The owner must gather all
   // ToolsAPI state up front (project info, open editor texts) - nothing in
-  // Execute may touch the IDE. OnProgress/OnTerminate fire on the main thread.
+  // Execute may touch the IDE. Completion/progress is polled by the UI owner.
   TDepTreeGraphBuildThread = class(TThread)
   private
     FProject: TDepTreeProjectInfo;
@@ -62,14 +62,11 @@ type
     FError: string;
     FCancelled: Boolean;
     FParsedCount: Integer;
-    FOnProgress: TNotifyEvent;
-    procedure NotifyProgress;
   protected
     procedure Execute; override;
   public
     // AOverrideTexts is owned by the thread; ACache is borrowed and must
-    // outlive it. The thread is created suspended - assign the events, then
-    // call Start.
+    // outlive it. The thread is created suspended; call Start after storing it.
     constructor Create(const AProject: TDepTreeProjectInfo;
       AOverrideTexts: TDictionary<string, string>; ACache: TDepTreeParseCache);
     destructor Destroy; override;
@@ -81,7 +78,6 @@ type
     property Error: string read FError;
     property Cancelled: Boolean read FCancelled;
     property ParsedCount: Integer read FParsedCount;
-    property OnProgress: TNotifyEvent read FOnProgress write FOnProgress;
   end;
 
 implementation
@@ -365,9 +361,9 @@ end;
 
 destructor TDepTreeGraphBuildThread.Destroy;
 begin
-  inherited;
   FGraph.Free;
   FOverrideTexts.Free;
+  inherited;
 end;
 
 procedure TDepTreeGraphBuildThread.Cancel;
@@ -380,12 +376,6 @@ function TDepTreeGraphBuildThread.DetachGraph: TDepTreeGraph;
 begin
   Result := FGraph;
   FGraph := nil;
-end;
-
-procedure TDepTreeGraphBuildThread.NotifyProgress;
-begin
-  if Assigned(FOnProgress) then
-    FOnProgress(Self);
 end;
 
 procedure TDepTreeGraphBuildThread.Execute;
@@ -408,8 +398,6 @@ begin
       procedure(AFilesParsed: Integer)
       begin
         FParsedCount := AFilesParsed;
-        if (AFilesParsed = 1) or (AFilesParsed mod 25 = 0) then
-          TThread.Queue(Self, NotifyProgress);
       end);
   except
     on E: Exception do
