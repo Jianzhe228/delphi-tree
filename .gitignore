@@ -7,6 +7,7 @@
 *.map
 *.drc
 *.stat
+*.tmp
 __history/
 
 # Local Codex/MSBuild scratch output
